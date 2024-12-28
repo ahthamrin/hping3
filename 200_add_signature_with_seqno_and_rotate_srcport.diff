@@ -1,0 +1,191 @@
+Description: Allow signature with sequence number and rotate source port
+ (1) Signature must end with a contiguous underscores (_), example: abc___ will become abc000 to abc999 then it rotates back to abc000.
+ (2) -s <init_port> option accepts -s <init_port>-<last_port> format. If defined, the source port increases up to last_port instead of 65535 then rotates.
+Author: Achmad Husni Thamrin <ahthamrin@gmail.com>
+Last-Update: 2024-12-28
+
+Index: hping3-3.a2.ds2/datahandler.c
+===================================================================
+--- hping3-3.a2.ds2.orig/datahandler.c
++++ hping3-3.a2.ds2/datahandler.c
+@@ -26,7 +26,14 @@
+ 	}
+ 
+ 	if (opt_sign) {
+-		memcpy(data, sign, signlen); /* length pre-checked */
++                if (signlen_modulo > 1) {
++                    sprintf(sign_seq, sign_format, sequence % signlen_modulo);
++                    /* printf("%s\n",sign_seq); */
++                    memcpy(data, sign_seq, signlen);
++                }
++                else {
++		    memcpy(data, sign, signlen); /* length pre-checked */
++                }
+ 		data+=signlen;
+ 		data_size-=signlen;
+ 	}
+Index: hping3-3.a2.ds2/docs/hping3.8
+===================================================================
+--- hping3-3.a2.ds2.orig/docs/hping3.8
++++ hping3-3.a2.ds2/docs/hping3.8
+@@ -446,10 +446,11 @@
+ Alias for \-\-icmptype 17 (to send ICMP address mask requests).
+ .SH TCP/UDP RELATED OPTIONS
+ .TP
+-.I -s --baseport source port
++.I -s --baseport source port[-last source port]
+ hping3 uses source port in order to guess replies sequence number. It
+ starts with a base source port number, and increase this number for each
+-packet sent. When packet is received sequence number can be computed as
++packet sent. If last source port is defined, the source port rotates.
++When packet is received sequence number can be computed as
+ .IR "replies.dest.port - base.source.port" .
+ Default base source port is random, using this option you are able to
+ set different number. If you need that source port not be increased for
+@@ -560,6 +561,8 @@
+ .I signature length
+ bytes of data with
+ .IR signature .
++If the signature ends with a series of underscores, the underscores are replaced with
++the 0 padded sequence number.
+ If the
+ .I signature length
+ is bigger than data size an error message will be displayed.
+Index: hping3-3.a2.ds2/globals.h
+===================================================================
+--- hping3-3.a2.ds2.orig/globals.h
++++ hping3-3.a2.ds2/globals.h
+@@ -25,6 +25,7 @@
+ 		virtual_mtu,
+ 		ip_frag_offset,
+ 		signlen,
++		signlen_modulo,
+ 		lsr_length,
+ 		ssr_length,
+ 		ip_tos,
+@@ -95,6 +96,7 @@
+ 		dst_port,
+ 		src_port,
+ 		initsport,
++		lastsport,
+ 		sequence,
+ 		src_winsize,
+ 		src_thoff,
+@@ -127,6 +129,8 @@
+ 		icmp_ip_dstip[1024],
+ 		icmp_gwip[1024],
+ 		sign[1024],
++		sign_seq[1024],
++		sign_format[1024],
+ 		rsign[1024],
+ 		ip_opt[40],
+ 		ip_optlen,
+Index: hping3-3.a2.ds2/main.c
+===================================================================
+--- hping3-3.a2.ds2.orig/main.c	
++++ hping3-3.a2.ds2/main.c
+@@ -42,6 +42,7 @@
+ 	virtual_mtu	= DEFAULT_VIRTUAL_MTU,
+ 	ip_frag_offset	= 0,
+ 	signlen,
++	signlen_modulo,
+ 	lsr_length = 0,
+ 	ssr_length = 0,
+ 	tcp_ack,
+@@ -115,6 +116,7 @@
+ 	src_port,
+ 	sequence	= 0,
+ 	initsport	= DEFAULT_INITSPORT,
++	lastsport	= 65536,
+ 	src_winsize	= DEFAULT_SRCWINSIZE,
+ 	src_thoff 	= (TCPHDR_SIZE >> 2),
+ 	count		= DEFAULT_COUNT,
+@@ -144,6 +146,8 @@
+ 	icmp_ip_dstip	[1024],
+ 	icmp_gwip	[1024],
+ 	sign		[1024],
++	sign_seq        [1024],
++	sign_format     [1024],
+ 	rsign		[1024], /* reverse sign (hping -> gniph) */
+ 	ip_opt		[40],
+ 	*opt_scanports = "";
+@@ -176,7 +180,7 @@
+ int main(int argc, char **argv)
+ {
+ 	char setflags[1024] = {'\0'};
+-	int c, hdr_size;
++	int c, i, j, hdr_size;
+ 
+ 	/* Check for the scripting mode */
+ 	if (argc == 1 || (argc > 1 && !strcmp(argv[1], "exec"))) {
+@@ -200,6 +204,21 @@
+ 		exit(1);
+ 	}
+ 
++        /* sign sequence */
++        if (data_size >= signlen) {
++            j = 0;
++            for (i = signlen - 1; i >= 0; --i) {
++                if (sign[i] != '_')
++                    break;
++                ++j;
++                sign[i] = '\0';
++            }
++            sprintf(sign_format, "%s%s%d%s", sign, "%0", j, "d");
++            signlen_modulo = 1;
++            for (i = 0; i < j; ++i)
++                signlen_modulo *= 10;
++        }
++
+ 	/* reverse sign */
+ 	if (opt_sign || opt_listenmode) {
+ 		char *src = sign+strlen(sign)-1; /* last char before '\0' */
+Index: hping3-3.a2.ds2/parseoptions.c
+===================================================================
+--- hping3-3.a2.ds2.orig/parseoptions.c	
++++ hping3-3.a2.ds2/parseoptions.c
+@@ -275,6 +275,18 @@
+ 			break;
+ 		case OPT_BASEPORT:
+ 			initsport = strtol(ago_optarg, NULL, 0);
++                        /* last source port */
++                        char* ago_optarg_2;
++
++                        lastsport = 65535;
++                        ago_optarg_2 = strchr(ago_optarg, '-');
++                        if (ago_optarg_2)
++                        {
++                            ago_optarg_2++;
++                            lastsport = strtol(ago_optarg_2, NULL, 0);
++                            if (lastsport < initsport || lastsport > 65536)
++                                lastsport = 65536;
++                        }
+ 			break;
+ 		case OPT_TTL:
+ 			src_ttl = strtol(ago_optarg, NULL, 0);
+Index: hping3-3.a2.ds2/sendtcp.c
+===================================================================
+--- hping3-3.a2.ds2.orig/sendtcp.c
++++ hping3-3.a2.ds2/sendtcp.c
+@@ -106,7 +106,7 @@
+ 
+ 	sequence++;	/* next sequence number */
+ 	if (!opt_keepstill)
+-		src_port = (sequence + initsport) % 65536;
++		src_port = (sequence % (lastsport - initsport) + initsport) % 65536;
+ 
+ 	if (opt_force_incdport)
+ 		dst_port++;
+Index: hping3-3.a2.ds2/sendudp.c
+===================================================================
+--- hping3-3.a2.ds2.orig/sendudp.c
++++ hping3-3.a2.ds2/sendudp.c
+@@ -74,7 +74,7 @@
+ 	sequence++;	/* next sequence number */
+ 
+ 	if (!opt_keepstill)
+-		src_port = (sequence + initsport) % 65536;
++		src_port = (sequence % (lastsport - initsport) + initsport) % 65536;
+ 
+ 	if (opt_force_incdport)
+ 		dst_port++;
